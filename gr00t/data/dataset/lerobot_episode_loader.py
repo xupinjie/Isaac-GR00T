@@ -517,7 +517,10 @@ class LeRobotEpisodeLoader:
                     self.modality_meta[modality][joint_key]["start"],
                     self.modality_meta[modality][joint_key]["end"],
                 )
-                for stat_type in self.stats[stats_key].keys():  # mean, std, min, max, q01, q99
+                # LeRobot stats may also contain scalar metadata such as ``count`` and
+                # additional quantiles. Only normalization statistics are sliceable and
+                # consumed by the downstream state/action processor.
+                for stat_type in ("mean", "std", "min", "max", "q01", "q99"):
                     dataset_statistics[modality][joint_key][stat_type] = self.stats[stats_key][
                         stat_type
                     ][start_idx:end_idx]
