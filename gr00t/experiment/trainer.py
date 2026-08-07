@@ -190,6 +190,7 @@ class Gr00tTrainer(Trainer):
         """
         self.action_offset = kwargs.pop("action_offset", None)
         self.multiprocessing_context = kwargs.pop("multiprocessing_context", "fork")
+        self._nvc_batch_prefetcher = None
         super().__init__(
             *args,
             **kwargs,
@@ -226,6 +227,7 @@ class Gr00tTrainer(Trainer):
         )
         # Use persistent workers for sharded dataset if num_workers is greater than 0
         persistent_workers = self.args.dataloader_num_workers > 0
+        uses_nvc_gop = getattr(self.train_dataset, "uses_nvc_gop_pipeline", lambda: False)()
 
         dataloader_params = {
             "batch_size": self._train_batch_size,
@@ -239,7 +241,24 @@ class Gr00tTrainer(Trainer):
         if self.args.dataloader_num_workers > 0:
             dataloader_params["multiprocessing_context"] = self.multiprocessing_context
 
-        return torch.utils.data.DataLoader(self.train_dataset, **dataloader_params)
+        dataloader = torch.utils.data.DataLoader(self.train_dataset, **dataloader_params)
+        if not uses_nvc_gop:
+            return dataloader
+
+        if self._nvc_batch_prefetcher is not None:
+            self._nvc_batch_prefetcher.close()
+
+        from gr00t.data.video.nvc_gop_pipeline import NvcGopBatchPrefetcher
+
+        self._nvc_batch_prefetcher = NvcGopBatchPrefetcher(
+            dataloader,
+            dataset=self.train_dataset,
+            processor=self.train_dataset.processor,
+            batch_size=self._train_batch_size,
+            num_workers=self.args.dataloader_num_workers,
+            device=self.args.device,
+        )
+        return self._nvc_batch_prefetcher
 
     def train(
         self,
@@ -264,7 +283,12 @@ class Gr00tTrainer(Trainer):
                 os.path.join(resume_from_checkpoint, TRAINER_STATE_NAME)
             )
 
-        return super().train(resume_from_checkpoint=resume_from_checkpoint, **kwargs)
+        try:
+            return super().train(resume_from_checkpoint=resume_from_checkpoint, **kwargs)
+        finally:
+            if self._nvc_batch_prefetcher is not None:
+                self._nvc_batch_prefetcher.close()
+                self._nvc_batch_prefetcher = None
 
     # ------------------------------------------------------------------
     # Loss / accuracy computation override
@@ -292,6 +316,9 @@ class Gr00tTrainer(Trainer):
             return_outputs=True,
             num_items_in_batch=num_items_in_batch,
         )
+        # Overlap decode/transform(N+1) with backward/optimizer(N).
+        if self._nvc_batch_prefetcher is not None:
+            self._nvc_batch_prefetcher.start_prefetch_after_forward()
         # import ipdb; ipdb.set_trace()
         # # save the model's embedding for the first step
         # input_embeddings = model.get_input_embeddings().weight.data.cpu()

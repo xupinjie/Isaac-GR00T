@@ -41,12 +41,9 @@ MASTER_PORT=${MASTER_PORT:-29501}
 VIDEO_BACKEND=${VIDEO_BACKEND:-torchcodec}
 
 # Multiprocessing context: "fork", "spawn", "forkserver"
-# Use "spawn" when VIDEO_BACKEND="nvc" (NVIDIA GPU decoder requires spawn mode)
-if [ "${VIDEO_BACKEND}" = "nvc" ]; then
-    MULTIPROCESSING_CONTEXT=${MULTIPROCESSING_CONTEXT:-spawn}
-else
-    MULTIPROCESSING_CONTEXT=${MULTIPROCESSING_CONTEXT:-fork}
-fi
+# The async NVC path only demuxes GOPs in DataLoader workers; NVDEC runs in
+# the training process, so fork is safe and avoids spawn serialization costs.
+MULTIPROCESSING_CONTEXT=${MULTIPROCESSING_CONTEXT:-fork}
 
 # ============================================================================
 # Validate prerequisites

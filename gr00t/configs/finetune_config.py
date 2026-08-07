@@ -127,5 +127,6 @@ class FinetuneConfig:
     """
     Multiprocessing context for dataloader workers.
     Options: "fork", "spawn", "forkserver".
-    Use "spawn" when video_backend="nvc" (NVIDIA GPU decoder requires spawn mode).
+    The async nvc path defaults to "fork": workers only perform CPU GOP demux,
+    while NVDEC and GPU transforms run in the training process.
     """

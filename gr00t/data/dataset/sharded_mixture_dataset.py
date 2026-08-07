@@ -335,6 +335,19 @@ class ShardedMixtureDataset(IterableDataset):
         return filtered_schedule
 
     def __iter__(self):
+        uses_nvc_gop = self.uses_nvc_gop_pipeline()
+        try:
+            yield from self._iter_shards(uses_nvc_gop)
+        finally:
+            if uses_nvc_gop:
+                for dataset in self.datasets:
+                    close_worker_resources = getattr(
+                        dataset, "close_nvc_gop_worker_resources", None
+                    )
+                    if close_worker_resources is not None:
+                        close_worker_resources()
+
+    def _iter_shards(self, uses_nvc_gop: bool):
         """
         Iterate over the mixture dataset with background shard caching.
 
@@ -376,7 +389,14 @@ class ShardedMixtureDataset(IterableDataset):
             indices_in_shard = np.arange(len(self.curr_shard))
             rng.shuffle(indices_in_shard)
             for index in indices_in_shard:
-                yield self.curr_shard[index]
+                datapoint = self.curr_shard[index]
+                if uses_nvc_gop:
+                    materialize = getattr(
+                        self.datasets[dataset_index], "materialize_datapoint", None
+                    )
+                    if materialize is not None:
+                        datapoint = materialize(datapoint)
+                yield datapoint
 
             # Clean up cached shard to free memory
             self.delete_cached_shard()
@@ -475,3 +495,26 @@ class ShardedMixtureDataset(IterableDataset):
             if hasattr(dataset, "get_initial_actions"):
                 initial_actions.extend(dataset.get_initial_actions())  # type: ignore
         return initial_actions
+
+    def uses_nvc_gop_pipeline(self) -> bool:
+        return any(getattr(dataset, "video_backend", None) == "nvc" for dataset in self.datasets)
+
+    def get_nvc_gop_shape(self) -> tuple[int, int]:
+        shapes = [
+            dataset.get_nvc_gop_shape()
+            for dataset in self.datasets
+            if getattr(dataset, "video_backend", None) == "nvc"
+        ]
+        if not shapes:
+            raise RuntimeError("Dataset mixture does not use the nvc GOP pipeline")
+        return max(shape[0] for shape in shapes), max(shape[1] for shape in shapes)
+
+    def configure_nvc_gop_store(self, store_id: int, capacity: int) -> None:
+        for dataset in self.datasets:
+            if getattr(dataset, "video_backend", None) == "nvc":
+                dataset.configure_nvc_gop_store(store_id=store_id, capacity=capacity)
+
+    def clear_nvc_gop_store_configuration(self) -> None:
+        for dataset in self.datasets:
+            if getattr(dataset, "video_backend", None) == "nvc":
+                dataset.clear_nvc_gop_store_configuration()
