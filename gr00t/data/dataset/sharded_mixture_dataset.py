@@ -345,41 +345,63 @@ class ShardedMixtureDataset(IterableDataset):
         4. Shuffle timesteps within each shard for additional randomization
         5. Handle epoch transitions and schedule regeneration
         """
-        # Start background thread pool
-        self._executor = ThreadPoolExecutor(max_workers=1)
+        # Start background thread pool. The executor must be explicitly shut down
+        # when DataLoader closes this infinite iterator; otherwise its non-daemon
+        # thread keeps spawned workers alive after Trainer reaches max_steps.
+        executor = ThreadPoolExecutor(max_workers=1)
+        self._executor = executor
 
-        # Initialize worker-specific shard schedule
-        self.worker_shard_sampling_schedule = self.filter_shard_sample_schedule()
-        self.curr_shard_index = -1
-        self.cache_next_shard()
-        rng = np.random.default_rng(self.seed + self.epoch)
-
-        # Continuous iteration with epoch management
-        while True:
-            self.curr_shard_index += 1
-
-            # Wait for background caching to complete
-            wait_start = time.time()
-            self.finish_cache_shard()
-            wait_end = time.time()
-
-            dataset_index, shard_index = self.worker_shard_sampling_schedule[self.curr_shard_index]
-            print(
-                f"Rank {self.rank}, Worker {self.worker_id}: Wait for shard {shard_index} in dataset {dataset_index} in {wait_end - wait_start:.2f} seconds"
-            )
-
-            # Start caching next shard immediately
+        try:
+            # Initialize worker-specific shard schedule
+            self.worker_shard_sampling_schedule = self.filter_shard_sample_schedule()
+            self.curr_shard_index = -1
             self.cache_next_shard()
+            rng = np.random.default_rng(self.seed + self.epoch)
 
-            # Yield shuffled timesteps from current shard
-            assert self.curr_shard is not None
-            indices_in_shard = np.arange(len(self.curr_shard))
-            rng.shuffle(indices_in_shard)
-            for index in indices_in_shard:
-                yield self.curr_shard[index]
+            # Continuous iteration with epoch management
+            while True:
+                self.curr_shard_index += 1
 
-            # Clean up cached shard to free memory
-            self.delete_cached_shard()
+                # Wait for background caching to complete
+                wait_start = time.time()
+                self.finish_cache_shard()
+                wait_end = time.time()
+
+                dataset_index, shard_index = self.worker_shard_sampling_schedule[
+                    self.curr_shard_index
+                ]
+                print(
+                    f"Rank {self.rank}, Worker {self.worker_id}: Wait for shard {shard_index} in dataset {dataset_index} in {wait_end - wait_start:.2f} seconds"
+                )
+
+                # Start caching next shard immediately
+                self.cache_next_shard()
+
+                # Yield shuffled timesteps from current shard
+                assert self.curr_shard is not None
+                indices_in_shard = np.arange(len(self.curr_shard))
+                rng.shuffle(indices_in_shard)
+                for index in indices_in_shard:
+                    datapoint = self.curr_shard[index]
+                    materialize = getattr(
+                        self.datasets[dataset_index], "materialize_datapoint", None
+                    )
+                    yield materialize(datapoint) if materialize is not None else datapoint
+
+                # Clean up cached shard to free memory
+                self.delete_cached_shard()
+        finally:
+            if self._cache_job is not None:
+                self._cache_job.cancel()
+            executor.shutdown(wait=False, cancel_futures=True)
+            self._cache_job = None
+            self._executor = None
+            for dataset in self.datasets:
+                close_worker_resources = getattr(
+                    dataset, "close_nvc_gop_worker_resources", None
+                )
+                if close_worker_resources is not None:
+                    close_worker_resources()
 
     def cache_next_shard(self):
         """
@@ -475,3 +497,26 @@ class ShardedMixtureDataset(IterableDataset):
             if hasattr(dataset, "get_initial_actions"):
                 initial_actions.extend(dataset.get_initial_actions())  # type: ignore
         return initial_actions
+
+    def uses_nvc_gop_pipeline(self) -> bool:
+        return any(getattr(dataset, "video_backend", None) == "nvc" for dataset in self.datasets)
+
+    def get_nvc_gop_shape(self) -> tuple[int, int]:
+        shapes = [
+            dataset.get_nvc_gop_shape()
+            for dataset in self.datasets
+            if getattr(dataset, "video_backend", None) == "nvc"
+        ]
+        if not shapes:
+            raise RuntimeError("Dataset mixture does not use the nvc GOP pipeline")
+        return max(shape[0] for shape in shapes), max(shape[1] for shape in shapes)
+
+    def configure_nvc_gop_store(self, store_id: int, capacity: int) -> None:
+        for dataset in self.datasets:
+            if getattr(dataset, "video_backend", None) == "nvc":
+                dataset.configure_nvc_gop_store(store_id=store_id, capacity=capacity)
+
+    def clear_nvc_gop_store_configuration(self) -> None:
+        for dataset in self.datasets:
+            if getattr(dataset, "video_backend", None) == "nvc":
+                dataset.clear_nvc_gop_store_configuration()

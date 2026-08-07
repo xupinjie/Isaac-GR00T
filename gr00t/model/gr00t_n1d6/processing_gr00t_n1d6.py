@@ -1,4 +1,5 @@
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -11,9 +12,11 @@ from gr00t.data.embodiment_tags import EmbodimentTag
 from gr00t.data.interfaces import BaseProcessor
 from gr00t.data.state_action.state_action_processor import StateActionProcessor
 from gr00t.data.utils import parse_modality_configs, to_json_serializable
+from gr00t.data.video.nvc_gop_pipeline import NVC_GOP_REQUEST_KEY
 import numpy as np
 from PIL import Image
 import torch
+from torchvision.transforms import InterpolationMode
 import torchvision.transforms.v2 as transforms
 from transformers import AutoProcessor, ProcessorMixin
 from transformers.feature_extraction_utils import BatchFeature
@@ -72,7 +75,11 @@ class Gr00tN1d6DataCollator:
 
         for key in keys:
             values = [elem[key] for elem in features if key in elem]
-            if key == "vlm_content":
+            if key == NVC_GOP_REQUEST_KEY:
+                if len(values) != len(features):
+                    raise RuntimeError("Cannot mix deferred and decoded video samples in one batch")
+                batch[key] = values
+            elif key == "vlm_content":
                 # Handle vlm_content specially - extract text and images
                 text_list = []
                 image_inputs = []
@@ -284,10 +291,12 @@ class Gr00tN1d6Processor(BaseProcessor):
             }
         }
 
-    def __call__(
+    def process_non_visual(
         self,
         messages: list[dict[str, Any]],
-    ):
+    ) -> tuple[dict[str, Any], str]:
+        """Normalize and pad state/action while leaving video unresolved."""
+
         assert len(messages) == 1
         content = messages[0]["content"]
         embodiment_tag = content.embodiment
@@ -355,36 +364,40 @@ class Gr00tN1d6Processor(BaseProcessor):
             dim=-1,
         )
 
-        # Crop and resize images.
-        if self.training:
-            image_transform = self.train_image_transform
-        else:
-            image_transform = self.eval_image_transform
-        image_keys = self.modality_configs[embodiment_tag.value]["video"].modality_keys
-
         if self.formalize_language:
             language = content.text.lower()
             language = re.sub(r"[^\w\s]", "", language)
         else:
             language = content.text
 
-        vlm_inputs = self._get_vlm_inputs(
-            image_keys=image_keys,
-            images=content.images,
-            image_transform=image_transform,
-            language=language,
-        )
-
         transformed_inputs = {
             "state": normalized_states.to(torch.get_default_dtype()),
         }
         if normalized_actions is not None:
             transformed_inputs["action"] = normalized_actions.to(torch.get_default_dtype())
-        # Add VLM inputs
-        transformed_inputs.update(vlm_inputs)
         if action_mask is not None:
             transformed_inputs["action_mask"] = action_mask
         transformed_inputs["embodiment_id"] = self.embodiment_id_mapping[embodiment_tag.value]
+        return transformed_inputs, language
+
+    def __call__(
+        self,
+        messages: list[dict[str, Any]],
+    ):
+        transformed_inputs, language = self.process_non_visual(messages)
+        content = messages[0]["content"]
+        embodiment_tag = content.embodiment
+
+        image_transform = self.train_image_transform if self.training else self.eval_image_transform
+        image_keys = self.modality_configs[embodiment_tag.value]["video"].modality_keys
+        transformed_inputs.update(
+            self._get_vlm_inputs(
+                image_keys=image_keys,
+                images=content.images,
+                image_transform=image_transform,
+                language=language,
+            )
+        )
         return transformed_inputs
 
     def _get_vlm_inputs(
@@ -429,6 +442,147 @@ class Gr00tN1d6Processor(BaseProcessor):
 
         vlm_inputs = self._apply_vlm_processing(stacked_images, language)
         return vlm_inputs
+
+    def _transform_decoded_images(self, images: torch.Tensor) -> torch.Tensor:
+        """Apply the configured image augmentation directly to CUDA CHW tensors."""
+
+        if images.ndim != 4 or images.shape[1] != 3 or images.dtype != torch.uint8:
+            raise ValueError(
+                "Decoded images must have shape [T*V, 3, H, W] and dtype uint8; "
+                f"got shape={tuple(images.shape)} dtype={images.dtype}"
+            )
+
+        if not self.use_albumentations:
+            transform = self.train_image_transform if self.training else self.eval_image_transform
+            return self._resize_to_eagle_grid(transform(images))
+
+        if self.crop_fraction is None:
+            if self.image_crop_size is None or self.image_target_size is None:
+                raise ValueError(
+                    "crop_fraction or both image_crop_size/image_target_size are required"
+                )
+            crop_fraction = self.image_crop_size[0] / self.image_target_size[0]
+        else:
+            crop_fraction = self.crop_fraction
+        if self.shortest_image_edge is None:
+            if self.image_target_size is None:
+                raise ValueError("shortest_image_edge or image_target_size is required")
+            shortest_edge = self.image_target_size[0]
+        else:
+            shortest_edge = self.shortest_image_edge
+
+        images = transforms.functional.resize(
+            images,
+            size=int(shortest_edge),
+            interpolation=InterpolationMode.BILINEAR,
+            antialias=True,
+        )
+        height, width = images.shape[-2:]
+        crop_height = max(1, int(height * crop_fraction))
+        crop_width = max(1, int(width * crop_fraction))
+        if self.training:
+            top = int(torch.randint(0, height - crop_height + 1, (1,)).item())
+            left = int(torch.randint(0, width - crop_width + 1, (1,)).item())
+        else:
+            top = (height - crop_height) // 2
+            left = (width - crop_width) // 2
+        images = transforms.functional.crop(
+            images,
+            top=top,
+            left=left,
+            height=crop_height,
+            width=crop_width,
+        )
+        images = transforms.functional.resize(
+            images,
+            size=int(shortest_edge),
+            interpolation=InterpolationMode.BILINEAR,
+            antialias=True,
+        )
+
+        if self.training and self.random_rotation_angle not in (None, 0):
+            angle = float(
+                torch.empty(1).uniform_(
+                    -float(self.random_rotation_angle), float(self.random_rotation_angle)
+                ).item()
+            )
+            images = transforms.functional.rotate(
+                images,
+                angle=angle,
+                interpolation=InterpolationMode.BILINEAR,
+            )
+        if self.training and self.color_jitter_params is not None:
+            images = transforms.ColorJitter(**self.color_jitter_params)(images)
+        return self._resize_to_eagle_grid(images)
+
+    def _resize_to_eagle_grid(self, images: torch.Tensor) -> torch.Tensor:
+        """Match Eagle ``fetch_image`` sizing while keeping pixels on the GPU."""
+
+        factor = int(round(math.sqrt(self.processor.pixels_per_token)))
+        height, width = images.shape[-2:]
+        max_dimension = 500 * 14
+        resized_height = min(max(factor, round(height / factor) * factor), max_dimension)
+        resized_width = min(max(factor, round(width / factor) * factor), max_dimension)
+        min_pixels = 4 * factor * factor
+        max_pixels = 4096 * factor * factor
+        if resized_height * resized_width > max_pixels:
+            beta = math.sqrt((resized_height * resized_width) / max_pixels)
+            resized_height = math.floor(resized_height / beta / factor) * factor
+            resized_width = math.floor(resized_width / beta / factor) * factor
+        elif resized_height * resized_width < min_pixels:
+            beta = math.sqrt(min_pixels / (height * width))
+            resized_height = math.ceil(height * beta / factor) * factor
+            resized_width = math.ceil(width * beta / factor) * factor
+        if (resized_height, resized_width) == (height, width):
+            return images
+        return transforms.functional.resize(
+            images,
+            size=[resized_height, resized_width],
+            interpolation=InterpolationMode.BILINEAR,
+            antialias=True,
+        )
+
+    def collate_decoded_vlm_inputs(
+        self,
+        decoded_samples: list[torch.Tensor],
+        languages: list[str],
+        device: torch.device,
+    ) -> dict[str, Any]:
+        """GPU-transform decoded samples and run Eagle image normalization/tokenization."""
+
+        if len(decoded_samples) != len(languages):
+            raise ValueError("decoded_samples and languages must have equal lengths")
+
+        text_list = []
+        image_inputs = []
+        for images, language in zip(decoded_samples, languages):
+            transformed = self._transform_decoded_images(images)
+            conversation = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": language},
+                        *[{"type": "image"} for _ in range(len(transformed))],
+                    ],
+                }
+            ]
+            text_list.append(
+                self.processor.apply_chat_template(
+                    conversation,
+                    tokenize=False,
+                    add_generation_prompt=False,
+                )
+            )
+            image_inputs.extend(list(transformed))
+
+        vlm_inputs = self.processor(
+            text=text_list,
+            images=image_inputs,
+            return_tensors="pt",
+            padding=True,
+            images_kwargs={"device": device},
+        )
+        return dict(vlm_inputs)
 
     def save_pretrained(self, save_directory: str | Path) -> list[Path]:
         # dump modality configs to dict using the recursive function

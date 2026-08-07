@@ -44,7 +44,12 @@ class DatasetFactory:
 
         # Build video_backend_kwargs with correct GPU assignment for multi-GPU training
         # Each process uses its local rank as gpu_id for nvc (NVIDIA GPU decoder)
-        video_backend_kwargs = {"gpu_id": _get_local_rank()}
+        video_backend_kwargs = {}
+        if self.config.data.video_backend == "nvc":
+            video_backend_kwargs = {
+                "gpu_id": _get_local_rank(),
+                "gop_cache_capacity": self.config.data.nvc_gop_cache_capacity,
+            }
 
         for dataset_spec in tqdm(
             self.config.data.datasets,

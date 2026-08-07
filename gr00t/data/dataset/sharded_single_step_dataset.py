@@ -6,6 +6,7 @@ import pandas as pd
 
 from gr00t.data.interfaces import ShardedDataset
 from gr00t.data.types import EmbodimentTag, MessageType, ModalityConfig, VLAStepData
+from gr00t.data.video.nvc_gop_pipeline import NVC_GOP_REQUEST_KEY, NvcGopRequest
 
 from .lerobot_episode_loader import LeRobotEpisodeLoader
 
@@ -16,6 +17,7 @@ def extract_step_data(
     modality_configs: dict[str, ModalityConfig],
     embodiment_tag: EmbodimentTag,
     allow_padding: bool = False,
+    include_video: bool = True,
 ) -> VLAStepData:
     step_data = {}
 
@@ -24,6 +26,8 @@ def extract_step_data(
 
     # Extract data for each configured modality
     for modality, config in modality_configs.items():
+        if modality == "video" and not include_video:
+            continue
         step_data[modality] = {}
         # Sample timesteps according to delta indices configuration
         indices_to_load = [step_index + delta_index for delta_index in config.delta_indices]
@@ -243,6 +247,67 @@ class ShardedSingleStepDataset(ShardedDataset):
         messages = [{"type": MessageType.EPISODE_STEP.value, "content": vla_step_data}]
         return self.processor(messages)
 
+    def get_deferred_nvc_datapoint(
+        self,
+        episode_index: int,
+        episode_data: pd.DataFrame,
+        step_index: int,
+    ) -> dict:
+        """Process non-visual inputs and leave video as a deferred GOP request."""
+
+        assert self.processor is not None, "Processor must be set before getting datapoints"
+        process_non_visual = getattr(self.processor, "process_non_visual", None)
+        if process_non_visual is None:
+            raise TypeError(
+                "video_backend='nvc' requires a processor implementing process_non_visual"
+            )
+        vla_step_data = extract_step_data(
+            episode_data,
+            step_index,
+            self.modality_configs,
+            self.embodiment_tag,
+            self.allow_padding,
+            include_video=False,
+        )
+        messages = [{"type": MessageType.EPISODE_STEP.value, "content": vla_step_data}]
+        datapoint, language = process_non_visual(messages)
+        request = self.episode_loader.build_nvc_gop_request(
+            episode_index=episode_index,
+            step_index=step_index,
+            max_length=len(episode_data),
+            language=language,
+            allow_padding=self.allow_padding,
+        )
+        datapoint[NVC_GOP_REQUEST_KEY] = request
+        return datapoint
+
+    def materialize_datapoint(self, datapoint: dict) -> dict:
+        """Populate GOP refs just before a sample enters the DataLoader queue."""
+
+        request = datapoint.get(NVC_GOP_REQUEST_KEY)
+        if request is None:
+            return datapoint
+        if not isinstance(request, NvcGopRequest):
+            raise TypeError(f"Expected NvcGopRequest, got {type(request)}")
+        materialized = dict(datapoint)
+        materialized[NVC_GOP_REQUEST_KEY] = self.episode_loader.materialize_nvc_gop_request(
+            request
+        )
+        return materialized
+
+    def configure_nvc_gop_store(self, store_id: int, capacity: int) -> None:
+        self.episode_loader.configure_nvc_gop_store(store_id=store_id, capacity=capacity)
+
+    def clear_nvc_gop_store_configuration(self) -> None:
+        self.episode_loader.clear_nvc_gop_store_configuration()
+
+    def close_nvc_gop_worker_resources(self) -> None:
+        self.episode_loader.close_nvc_gop_worker_resources()
+
+    def get_nvc_gop_shape(self) -> tuple[int, int]:
+        video_config = self.modality_configs["video"]
+        return len(video_config.modality_keys), len(video_config.delta_indices)
+
     def get_shard_length(self, idx: int) -> int:
         """Get the number of timesteps in a specific shard."""
         return self.shard_lengths[idx]
@@ -266,15 +331,21 @@ class ShardedSingleStepDataset(ShardedDataset):
         episodes = self.sharded_episodes[idx]
         datapoints = []
         for ep_idx, step_indices in episodes:
-            # For nvc backend: use on-demand decoding to save ~90% decoding overhead
-            # For other backends: use original full episode loading
+            # The optimized nvc path only preloads compact CPU metadata. GOP
+            # extraction happens lazily in ``materialize_datapoint`` while the
+            # current shard is consumed, which bounds shared-memory residency.
             if self.video_backend == "nvc":
-                episode_data = self.episode_loader.load_episode_sampled(ep_idx, step_indices)
+                _, episode_data = self.episode_loader.load_episode_metadata(ep_idx)
             else:
                 episode_data = self.episode_loader[ep_idx]
 
             for step_index in step_indices:
-                datapoints.append(self.get_datapoint(episode_data, step_index))
+                if self.video_backend == "nvc":
+                    datapoints.append(
+                        self.get_deferred_nvc_datapoint(ep_idx, episode_data, int(step_index))
+                    )
+                else:
+                    datapoints.append(self.get_datapoint(episode_data, int(step_index)))
         return datapoints
 
     def get_dataset_statistics(self) -> dict:

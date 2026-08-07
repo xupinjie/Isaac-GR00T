@@ -78,3 +78,11 @@ class DataConfig:
     image_crop_size: List[int] = field(default_factory=lambda: [244, 244])
     image_target_size: List[int] = field(default_factory=lambda: [224, 224])
     video_backend: str = "torchcodec"
+    nvc_prefetch_factor: int = 2
+    """Number of compressed-GOP batches prefetched by each DataLoader worker."""
+
+    nvc_gop_store_capacity: int | None = None
+    """Shared GOP slots per rank. None sizes it from the maximum in-flight queue."""
+
+    nvc_gop_cache_capacity: int | None = None
+    """Optional per-worker ACCV-Lab demux cache capacity."""

@@ -26,6 +26,7 @@ import numpy as np
 import pandas as pd
 
 from gr00t.data.types import ModalityConfig
+from gr00t.data.video.nvc_gop_pipeline import NvcGopRequest
 from gr00t.utils.initial_actions import INITIAL_ACTIONS_FILENAME, load_initial_actions
 from gr00t.utils.video_utils import get_frames_by_indices
 
@@ -140,12 +141,57 @@ class LeRobotEpisodeLoader:
 
         # Initialize NVC decoder if using nvc backend (lazy initialization)
         self._nvc_decoder = None
+        self._nvc_gop_decoder = None
+        self._nvc_gop_store = None
+        self._nvc_gop_store_id = None
+        self._nvc_gop_store_capacity = None
         if self.video_backend == "nvc":
             if not NVC_AVAILABLE:
                 raise ImportError(
                     "accvlab.on_demand_video_decoder is not available. "
                     "Please install it or use a different video_backend."
                 )
+
+    def configure_nvc_gop_store(self, store_id: int, capacity: int) -> None:
+        """Configure the main-process-created shared GOP store for this loader.
+
+        The actual attachment is lazy so this object remains safe to pickle with
+        the ``spawn`` multiprocessing context.
+        """
+
+        if self.video_backend != "nvc":
+            return
+        self.close_nvc_gop_worker_resources()
+        self._nvc_gop_store_id = int(store_id)
+        self._nvc_gop_store_capacity = int(capacity)
+
+    def clear_nvc_gop_store_configuration(self) -> None:
+        self.close_nvc_gop_worker_resources()
+        self._nvc_gop_store_id = None
+        self._nvc_gop_store_capacity = None
+
+    def close_nvc_gop_worker_resources(self) -> None:
+        """Close worker-local handles without unlinking main-process storage."""
+
+        if self._nvc_gop_store is not None:
+            self._nvc_gop_store.close()
+            self._nvc_gop_store = None
+        if self._nvc_gop_decoder is not None:
+            # CreateGopDecoder may own both decoder resources and ``gs_*``
+            # shared-memory entries when GetGOPList(useGOPCache=True) is used.
+            # Dropping the Python reference is not sufficient to unlink that
+            # cache reliably when a persistent DataLoader worker shuts down.
+            try:
+                release_memory = getattr(
+                    self._nvc_gop_decoder, "release_device_memory", None
+                )
+                if release_memory is not None:
+                    release_memory()
+            finally:
+                release_decoder = getattr(self._nvc_gop_decoder, "release_decoder", None)
+                if release_decoder is not None:
+                    release_decoder()
+                self._nvc_gop_decoder = None
 
     def _load_metadata(self) -> None:
         """
@@ -490,6 +536,118 @@ class LeRobotEpisodeLoader:
 
         return video_data
 
+    def build_nvc_gop_request(
+        self,
+        episode_index: int,
+        step_index: int,
+        max_length: int,
+        language: str,
+        allow_padding: bool = False,
+    ) -> NvcGopRequest:
+        """Build a lightweight video request without reading or decoding video."""
+
+        if self.video_backend != "nvc":
+            raise RuntimeError("Deferred GOP requests are only available for video_backend='nvc'")
+        if not self.video_path_pattern or "video" not in self.modality_configs:
+            raise RuntimeError("The nvc GOP pipeline requires a configured video modality")
+
+        episode_meta = self.episodes_metadata[episode_index]
+        episode_id = episode_meta["episode_index"]
+        chunk_idx = episode_id // self.chunk_size
+        image_keys = self.modality_configs["video"].modality_keys
+
+        requested_ids = []
+        for delta in self.modality_configs["video"].delta_indices:
+            frame_id = int(step_index) + int(delta)
+            if allow_padding:
+                frame_id = max(0, min(frame_id, max_length - 1))
+            elif not 0 <= frame_id < max_length:
+                raise IndexError(
+                    f"Video frame {frame_id} is outside episode {episode_id} "
+                    f"with length {max_length}"
+                )
+            requested_ids.append(frame_id)
+
+        video_paths = []
+        for image_key in image_keys:
+            original_key = self.modality_meta["video"][image_key].get(
+                "original_key", f"observation.images.{image_key}"
+            )
+            assert original_key in self.feature_config, (
+                f"Original key {original_key} not found in feature config"
+            )
+            video_filename = self.video_path_pattern.format(
+                episode_chunk=chunk_idx,
+                video_key=original_key,
+                episode_index=episode_id,
+            )
+            video_paths.append(str(self.dataset_path / video_filename))
+
+        per_view_ids = tuple(tuple(requested_ids) for _ in image_keys)
+        return NvcGopRequest(
+            video_paths=tuple(video_paths),
+            frame_ids=per_view_ids,
+            image_keys=tuple(image_keys),
+            language=language,
+        )
+
+    def materialize_nvc_gop_request(self, request: NvcGopRequest) -> NvcGopRequest:
+        """Demux request GOPs in a worker and replace their bytes with SHM refs."""
+
+        if request.gop_refs is not None:
+            return request
+        if self._nvc_gop_store_id is None or self._nvc_gop_store_capacity is None:
+            raise RuntimeError(
+                "The nvc GOP store is not configured. The Trainer must create the "
+                "main-process NvcGopBatchPrefetcher before DataLoader workers start."
+            )
+        if self._nvc_gop_store is None:
+            self._nvc_gop_store = nvc.SharedGopStore.attach(
+                capacity=self._nvc_gop_store_capacity,
+                store_id=self._nvc_gop_store_id,
+            )
+        if self._nvc_gop_decoder is None:
+            gpu_id = int((self.video_backend_kwargs or {}).get("gpu_id", 0))
+            cache_capacity = (self.video_backend_kwargs or {}).get("gop_cache_capacity")
+            self._nvc_gop_decoder = nvc.CreateGopDecoder(
+                maxfiles=max(1, len(request.video_paths)),
+                iGpu=gpu_id,
+                gopCacheCapacity=cache_capacity,
+            )
+
+        refs_by_video: list[list[Any]] = []
+        for video_path, frame_ids in zip(request.video_paths, request.frame_ids):
+            refs_by_key = {}
+            for frame_id in frame_ids:
+                ref = self._nvc_gop_store.lookup(video_path, int(frame_id))
+                if ref is None:
+                    # Workers commonly consume adjacent steps from the same
+                    # episode. Keep ACCV-Lab's per-file GOP cache enabled so
+                    # those steps reuse the serialized GOP instead of opening
+                    # and demuxing the same HEVC range again. SharedGopStore is
+                    # a bounded hand-off queue, not a persistent GOP cache: an
+                    # entry may be released as soon as the main process reads
+                    # it, so its lookup alone cannot provide this reuse.
+                    numpy_data, first_frame_ids, gop_lens = self._nvc_gop_decoder.GetGOPList(
+                        [video_path], [int(frame_id)], useGOPCache=True
+                    )[0]
+                    if len(first_frame_ids) != 1 or len(gop_lens) != 1:
+                        raise RuntimeError(
+                            "ACCV-Lab GetGOPList returned an unexpected GOP description "
+                            f"for {video_path} frame {frame_id}"
+                        )
+                    ref = self._nvc_gop_store.put(
+                        video_path,
+                        int(first_frame_ids[0]),
+                        int(gop_lens[0]),
+                        np.asarray(numpy_data, dtype=np.uint8),
+                    )
+                refs_by_key[(ref.first_frame_id, ref.gop_len, ref.shm_name)] = ref
+            refs_by_video.append(
+                [refs_by_key[key] for key in sorted(refs_by_key, key=lambda item: item[0])]
+            )
+        return request.with_gop_refs(refs_by_video)
+
     def get_dataset_statistics(self) -> dict[str, Any]:
         """
         Extract dataset statistics for normalization from loaded metadata.
@@ -554,6 +712,28 @@ class LeRobotEpisodeLoader:
             raise ValueError(f"Language key {lang_key} not supported")
         return new_languages
 
+    def load_episode_metadata(self, episode_index: int) -> tuple[int, pd.DataFrame]:
+        """Load state/action/language data without touching video files."""
+
+        if episode_index < 0 or episode_index >= len(self):
+            raise IndexError(f"Episode index {episode_index} out of bounds")
+
+        episode_meta = self.episodes_metadata[episode_index]
+        episode_id = episode_meta["episode_index"]
+        nominal_length = episode_meta["length"]
+        df = self._load_parquet_data(episode_id)
+
+        if "language" in self.modality_configs:
+            lang_key = self.modality_configs["language"].modality_keys[0]
+            if lang_key in LANG_KEYS:
+                new_languages = self.create_language_from_meta(episode_meta, len(df), lang_key)
+                df["language." + lang_key] = new_languages
+
+        actual_length = min(len(df), nominal_length)
+        df = df.iloc[:actual_length].copy()
+        df.index = pd.RangeIndex(actual_length)
+        return episode_id, df
+
     def __getitem__(self, idx: int) -> pd.DataFrame:
         """
         Load complete episode data as a processed DataFrame.
@@ -572,25 +752,8 @@ class LeRobotEpisodeLoader:
         Raises:
             IndexError: If episode index is out of bounds
         """
-        if idx < 0 or idx >= len(self):
-            raise IndexError(f"Episode index {idx} out of bounds")
-
-        episode_meta = self.episodes_metadata[idx]
-        episode_id = episode_meta["episode_index"]
-        nominal_length = episode_meta["length"]
-
-        # Load and parse the parquet data
-        df = self._load_parquet_data(episode_id)
-
-        if "language" in self.modality_configs:
-            lang_key = self.modality_configs["language"].modality_keys[0]
-            if lang_key in LANG_KEYS:
-                new_languages = self.create_language_from_meta(episode_meta, len(df), lang_key)
-                df["language." + lang_key] = new_languages
-
-        # Use actual dataframe length (might be less than nominal)
-        actual_length = min(len(df), nominal_length)
-        df = df.iloc[:actual_length]
+        episode_id, df = self.load_episode_metadata(idx)
+        actual_length = len(df)
 
         # Load synchronized video data
         video_data = self._load_video_data(episode_id, np.arange(actual_length))
@@ -672,29 +835,8 @@ class LeRobotEpisodeLoader:
             This method is specifically designed for nvc backend. Other backends
             should continue using __getitem__ which decodes all frames.
         """
-        if episode_index < 0 or episode_index >= len(self):
-            raise IndexError(f"Episode index {episode_index} out of bounds")
-
-        episode_meta = self.episodes_metadata[episode_index]
-        episode_id = episode_meta["episode_index"]
-        nominal_length = episode_meta["length"]
-
-        # Load complete parquet data (state, action, language) - this is fast
-        df = self._load_parquet_data(episode_id)
-
-        # Process language annotations from metadata
-        if "language" in self.modality_configs:
-            lang_key = self.modality_configs["language"].modality_keys[0]
-            if lang_key in LANG_KEYS:
-                new_languages = self.create_language_from_meta(episode_meta, len(df), lang_key)
-                df["language." + lang_key] = new_languages
-
-        # Use actual dataframe length (might be less than nominal)
-        actual_length = min(len(df), nominal_length)
-        df = df.iloc[:actual_length].copy()
-
-        # Set DataFrame index to frame numbers for .loc access compatibility
-        df.index = pd.RangeIndex(actual_length)
+        episode_id, df = self.load_episode_metadata(episode_index)
+        actual_length = len(df)
 
         # Compute required frame indices based on step_indices and all modality delta_indices
         required_frame_indices = self._compute_required_frame_indices(step_indices, actual_length)

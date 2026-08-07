@@ -129,3 +129,12 @@ class FinetuneConfig:
     Options: "fork", "spawn", "forkserver".
     Use "spawn" when video_backend="nvc" (NVIDIA GPU decoder requires spawn mode).
     """
+
+    nvc_prefetch_factor: int = 2
+    """Number of compressed-GOP batches prefetched by each DataLoader worker."""
+
+    nvc_gop_store_capacity: int | None = None
+    """Shared GOP slots per GPU rank. None selects a safe automatic capacity."""
+
+    nvc_gop_cache_capacity: int | None = None
+    """Optional number of GOP bundles cached by each worker demuxer."""

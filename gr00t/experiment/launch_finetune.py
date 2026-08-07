@@ -90,5 +90,8 @@ if __name__ == "__main__":
     config.data.num_shards_per_epoch = ft_config.num_shards_per_epoch
     config.data.video_backend = ft_config.video_backend
     config.data.multiprocessing_context = ft_config.multiprocessing_context
+    config.data.nvc_prefetch_factor = ft_config.nvc_prefetch_factor
+    config.data.nvc_gop_store_capacity = ft_config.nvc_gop_store_capacity
+    config.data.nvc_gop_cache_capacity = ft_config.nvc_gop_cache_capacity
 
     run(config)

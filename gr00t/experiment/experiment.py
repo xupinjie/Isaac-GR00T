@@ -228,6 +228,8 @@ def run(config: Config):
         eval_dataset=eval_dataset,
         data_collator=data_collator,
         multiprocessing_context=config.data.multiprocessing_context,
+        nvc_prefetch_factor=config.data.nvc_prefetch_factor,
+        nvc_gop_store_capacity=config.data.nvc_gop_store_capacity,
     )
 
     trainer.add_callback(

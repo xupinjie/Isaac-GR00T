@@ -84,6 +84,23 @@ class Config:
 
     def validate(self):
         """Validate configuration."""
+        if self.data.video_backend == "nvc":
+            if self.data.nvc_prefetch_factor < 1:
+                raise ValueError("data.nvc_prefetch_factor must be at least 1")
+            if (
+                self.data.nvc_gop_store_capacity is not None
+                and self.data.nvc_gop_store_capacity < 1
+            ):
+                raise ValueError("data.nvc_gop_store_capacity must be positive")
+            if (
+                self.training.dataloader_num_workers > 0
+                and self.data.multiprocessing_context != "spawn"
+            ):
+                raise ValueError(
+                    "video_backend='nvc' requires multiprocessing_context='spawn' "
+                    "when DataLoader workers are enabled"
+                )
+
         # Check dataset path(s)
         embodiment_tags = set()
         for d_cfg in self.data.datasets:
