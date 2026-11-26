@@ -335,6 +335,11 @@ class ShardedMixtureDataset(IterableDataset):
         return filtered_schedule
 
     def __iter__(self):
+        for shard, indices in self.iter_cached_shards():
+            for index in indices:
+                yield shard[index]
+
+    def iter_cached_shards(self, load_shard=None):
         """
         Iterate over the mixture dataset with background shard caching.
 
@@ -351,7 +356,7 @@ class ShardedMixtureDataset(IterableDataset):
         # Initialize worker-specific shard schedule
         self.worker_shard_sampling_schedule = self.filter_shard_sample_schedule()
         self.curr_shard_index = -1
-        self.cache_next_shard()
+        self.cache_next_shard(load_shard)
         rng = np.random.default_rng(self.seed + self.epoch)
 
         # Continuous iteration with epoch management
@@ -369,19 +374,18 @@ class ShardedMixtureDataset(IterableDataset):
             )
 
             # Start caching next shard immediately
-            self.cache_next_shard()
+            self.cache_next_shard(load_shard)
 
             # Yield shuffled timesteps from current shard
             assert self.curr_shard is not None
             indices_in_shard = np.arange(len(self.curr_shard))
             rng.shuffle(indices_in_shard)
-            for index in indices_in_shard:
-                yield self.curr_shard[index]
+            yield self.curr_shard, indices_in_shard
 
             # Clean up cached shard to free memory
             self.delete_cached_shard()
 
-    def cache_next_shard(self):
+    def cache_next_shard(self, load_shard=None):
         """
         Start background caching of the next shard using ThreadPoolExecutor.
 
@@ -401,9 +405,11 @@ class ShardedMixtureDataset(IterableDataset):
             self.curr_shard_index + 1
         ]
         # Submit background loading job
-        self._cache_job = self._executor.submit(
-            self.datasets[next_dataset_idx].get_shard, next_shard_idx
-        )
+        dataset = self.datasets[next_dataset_idx]
+        if load_shard is None:
+            self._cache_job = self._executor.submit(dataset.get_shard, next_shard_idx)
+        else:
+            self._cache_job = self._executor.submit(load_shard, dataset, next_shard_idx)
 
     def finish_cache_shard(self):
         """Wait for the background caching job to complete and retrieve the shard."""

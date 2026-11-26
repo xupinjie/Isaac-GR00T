@@ -332,24 +332,12 @@ class LeRobotEpisodeLoader:
 
         return loaded_df
 
-    def _load_video_data(self, episode_index: int, indices: np.ndarray) -> dict[str, np.ndarray]:
-        """
-        Load video data for all configured camera views at specified indices.
-
-        Uses the configured video backend to decode video frames at the exact indices
-        needed for the episode, supporting multiple camera views simultaneously.
-
-        Args:
-            episode_index: Index of the episode to load videos for
-            indices: Array of indices to extract frames at
-
-        Returns:
-            Dictionary mapping camera view names to arrays of decoded frames
-        """
-        video_data = {}
+    def get_video_paths(self, episode_index: int) -> dict[str, str]:
+        """Resolve the video path for each configured camera."""
+        paths = {}
 
         if not self.video_path_pattern or "video" not in self.modality_configs:
-            return video_data
+            return paths
 
         chunk_idx = episode_index // self.chunk_size
         image_keys = self.modality_configs["video"].modality_keys
@@ -367,17 +355,20 @@ class LeRobotEpisodeLoader:
             video_filename = self.video_path_pattern.format(
                 episode_chunk=chunk_idx, video_key=original_key, episode_index=episode_index
             )
-            video_path = self.dataset_path / video_filename
+            paths[image_key] = str(self.dataset_path / video_filename)
+        return paths
 
-            # Decode video frames at specified timestamps
-            video_data[image_key] = get_frames_by_indices(
-                str(video_path),
+    def _load_video_data(self, episode_index: int, indices: np.ndarray) -> dict[str, np.ndarray]:
+        return {
+            image_key: get_frames_by_indices(
+                path,
                 indices,
                 video_backend=self.video_backend,
                 video_backend_kwargs=self.video_backend_kwargs or {},
             )
 
-        return video_data
+            for image_key, path in self.get_video_paths(episode_index).items()
+        }
 
     def get_dataset_statistics(self) -> dict[str, Any]:
         """
@@ -440,24 +431,8 @@ class LeRobotEpisodeLoader:
             raise ValueError(f"Language key {lang_key} not supported")
         return new_languages
 
-    def __getitem__(self, idx: int) -> pd.DataFrame:
-        """
-        Load complete episode data as a processed DataFrame.
-
-        Combines parquet data loading and video decoding to create a unified DataFrame
-        containing all modality data for the episode. Video frames are converted to
-        PIL Images and stored in the DataFrame.
-
-        Args:
-            idx: Episode index to load
-
-        Returns:
-            DataFrame with columns for all modalities and timestamps, with video frames
-            as PIL Images ready for further processing
-
-        Raises:
-            IndexError: If episode index is out of bounds
-        """
+    def load_episode_metadata(self, idx: int) -> tuple[int, pd.DataFrame]:
+        """Load state, action and language without opening the camera videos."""
         if idx < 0 or idx >= len(self):
             raise IndexError(f"Episode index {idx} out of bounds")
 
@@ -476,10 +451,12 @@ class LeRobotEpisodeLoader:
 
         # Use actual dataframe length (might be less than nominal)
         actual_length = min(len(df), nominal_length)
-        df = df.iloc[:actual_length]
+        return episode_id, df.iloc[:actual_length]
 
-        # Load synchronized video data
-        video_data = self._load_video_data(episode_id, np.arange(actual_length))
+    def __getitem__(self, idx: int) -> pd.DataFrame:
+        """Load metadata and synchronized camera frames for an episode."""
+        episode_id, df = self.load_episode_metadata(idx)
+        video_data = self._load_video_data(episode_id, np.arange(len(df)))
 
         # Add video frames to dataframe as PIL Images
         for key in video_data.keys():

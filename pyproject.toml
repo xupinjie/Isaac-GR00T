@@ -40,6 +40,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+dali = [
+    "nvidia-dali-cuda120==2.4.0",
+]
 dev = [
     "ruff",
     "ipython",

@@ -38,7 +38,7 @@ def warn_configs(config: Config):
         "global_batch_size must be divisible by num_gpus"
     )
 
-    if config.data.video_backend != "torchcodec":
+    if config.data.video_backend not in {"torchcodec", "dali_proxy"}:
         warnings.warn(
             "video_backend is not torchcodec. Only torchcodec will be supported in the future."
         )
@@ -228,6 +228,7 @@ def run(config: Config):
         eval_dataset=eval_dataset,
         data_collator=data_collator,
         multiprocessing_context=config.data.multiprocessing_context,
+        video_backend=config.data.video_backend,
     )
 
     trainer.add_callback(

@@ -114,5 +114,8 @@ class FinetuneConfig:
     episode_sampling_rate: float = 0.1
     """Sampling rate for the episodes."""
 
+    video_backend: str = "torchcodec"
+    """Video backend. Use `dali_proxy` to enable the optional DALI GPU baseline."""
+
     num_shards_per_epoch: int = int(1e5)
     """Number of shards to use for the dataset. reduce this number if vram is limited."""

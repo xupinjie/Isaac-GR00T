@@ -190,6 +190,8 @@ class Gr00tTrainer(Trainer):
         """
         self.action_offset = kwargs.pop("action_offset", None)
         self.multiprocessing_context = kwargs.pop("multiprocessing_context", "fork")
+        self.video_backend = kwargs.pop("video_backend", "torchcodec")
+        self._dali_proxy_loader = None
         super().__init__(
             *args,
             **kwargs,
@@ -239,6 +241,19 @@ class Gr00tTrainer(Trainer):
         if self.args.dataloader_num_workers > 0:
             dataloader_params["multiprocessing_context"] = self.multiprocessing_context
 
+        if self.video_backend == "dali_proxy":
+            from gr00t.data.video.dali_proxy import DaliTrainingLoader
+
+            if self._dali_proxy_loader is not None:
+                self._dali_proxy_loader.close()
+            self._dali_proxy_loader = DaliTrainingLoader(
+                self.train_dataset,
+                device=self.args.device,
+                batch_size=self._train_batch_size,
+                num_workers=self.args.dataloader_num_workers,
+                collate_fn=data_collator,
+            )
+            return self._dali_proxy_loader
         return torch.utils.data.DataLoader(self.train_dataset, **dataloader_params)
 
     def train(
@@ -264,7 +279,12 @@ class Gr00tTrainer(Trainer):
                 os.path.join(resume_from_checkpoint, TRAINER_STATE_NAME)
             )
 
-        return super().train(resume_from_checkpoint=resume_from_checkpoint, **kwargs)
+        try:
+            return super().train(resume_from_checkpoint=resume_from_checkpoint, **kwargs)
+        finally:
+            if self._dali_proxy_loader is not None:
+                self._dali_proxy_loader.close()
+                self._dali_proxy_loader = None
 
     # ------------------------------------------------------------------
     # Loss / accuracy computation override
