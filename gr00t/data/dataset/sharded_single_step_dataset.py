@@ -259,8 +259,12 @@ class ShardedSingleStepDataset(ShardedDataset):
         episodes = self.sharded_episodes[idx]
         datapoints = []
         for ep_idx, step_indices in episodes:
-            # Load episode data once per episode in shard
-            episode_data = self.episode_loader[ep_idx]
+            if self.video_backend == "dali_pipeline":
+                episode_data = self.episode_loader.load_episode_sampled(
+                    ep_idx, step_indices, self.allow_padding
+                )
+            else:
+                episode_data = self.episode_loader[ep_idx]
             for step_index in step_indices:
                 datapoints.append(self.get_datapoint(episode_data, step_index))
         return datapoints

@@ -38,7 +38,7 @@ def warn_configs(config: Config):
         "global_batch_size must be divisible by num_gpus"
     )
 
-    if config.data.video_backend not in {"torchcodec", "dali_proxy"}:
+    if config.data.video_backend not in {"torchcodec", "dali_proxy", "dali_pipeline"}:
         warnings.warn(
             "video_backend is not torchcodec. Only torchcodec will be supported in the future."
         )

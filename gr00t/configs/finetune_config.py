@@ -115,7 +115,7 @@ class FinetuneConfig:
     """Sampling rate for the episodes."""
 
     video_backend: str = "torchcodec"
-    """Video backend. Use `dali_proxy` to enable the optional DALI GPU baseline."""
+    """Video backend: torchcodec (default), dali_proxy, or per-worker dali_pipeline (dali extra)."""
 
     num_shards_per_epoch: int = int(1e5)
     """Number of shards to use for the dataset. reduce this number if vram is limited."""

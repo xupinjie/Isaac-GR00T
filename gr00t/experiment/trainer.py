@@ -239,7 +239,9 @@ class Gr00tTrainer(Trainer):
 
         # multiprocessing_context can only be used with num_workers > 0
         if self.args.dataloader_num_workers > 0:
-            dataloader_params["multiprocessing_context"] = self.multiprocessing_context
+            dataloader_params["multiprocessing_context"] = (
+                "spawn" if self.video_backend == "dali_pipeline" else self.multiprocessing_context
+            )
 
         if self.video_backend == "dali_proxy":
             from gr00t.data.video.dali_proxy import DaliTrainingLoader

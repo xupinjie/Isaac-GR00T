@@ -114,6 +114,7 @@ class LeRobotEpisodeLoader:
         self.dataset_path = Path(dataset_path)
         self.video_backend = video_backend
         self.video_backend_kwargs = video_backend_kwargs
+        self._dali_decoder = None
 
         if not self.dataset_path.is_dir():
             raise FileNotFoundError(f"Dataset path does not exist: {self.dataset_path}")
@@ -359,6 +360,15 @@ class LeRobotEpisodeLoader:
         return paths
 
     def _load_video_data(self, episode_index: int, indices: np.ndarray) -> dict[str, np.ndarray]:
+        paths = self.get_video_paths(episode_index)
+        if self.video_backend == "dali_pipeline" and paths:
+            if self._dali_decoder is None:
+                from gr00t.data.video.dali_pipeline import DaliVideoDecoder
+
+                self._dali_decoder = DaliVideoDecoder(
+                    len(paths), **(self.video_backend_kwargs or {})
+                )
+            return self._dali_decoder.read(paths, indices)
         return {
             image_key: get_frames_by_indices(
                 path,
@@ -366,8 +376,7 @@ class LeRobotEpisodeLoader:
                 video_backend=self.video_backend,
                 video_backend_kwargs=self.video_backend_kwargs or {},
             )
-
-            for image_key, path in self.get_video_paths(episode_index).items()
+            for image_key, path in paths.items()
         }
 
     def get_dataset_statistics(self) -> dict[str, Any]:
@@ -452,6 +461,26 @@ class LeRobotEpisodeLoader:
         # Use actual dataframe length (might be less than nominal)
         actual_length = min(len(df), nominal_length)
         return episode_id, df.iloc[:actual_length]
+
+    def load_episode_sampled(
+        self, idx: int, step_indices: np.ndarray, allow_padding: bool
+    ) -> pd.DataFrame:
+        """Keep the full metadata index, but materialize only this fragment's camera frames."""
+        from gr00t.data.video.dali_pipeline import fragment_frame_indices
+
+        episode_id, df = self.load_episode_metadata(idx)
+        if "video" not in self.modality_configs:
+            return df
+        frames = fragment_frame_indices(
+            step_indices, self.modality_configs["video"].delta_indices, len(df), allow_padding
+        )
+        df = df.copy()
+        for key, images in self._load_video_data(episode_id, frames).items():
+            column = [None] * len(df)
+            for position, image in zip(frames, images, strict=True):
+                column[position] = image
+            df[f"video.{key}"] = column
+        return df
 
     def __getitem__(self, idx: int) -> pd.DataFrame:
         """Load metadata and synchronized camera frames for an episode."""
