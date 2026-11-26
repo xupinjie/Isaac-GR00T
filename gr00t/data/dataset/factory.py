@@ -42,8 +42,7 @@ class DatasetFactory:
         all_datasets = []
         all_weights = []
 
-        # Build video_backend_kwargs with correct GPU assignment for multi-GPU training
-        # Each process uses its local rank as gpu_id for nvc (NVIDIA GPU decoder)
+        # Assign each training process's decoder to its local GPU.
         video_backend_kwargs = {"gpu_id": _get_local_rank()}
 
         for dataset_spec in tqdm(

@@ -14,8 +14,11 @@ try:
     import decord
 
     DECORD_AVAILABLE = True
-except ImportError:
+    DECORD_IMPORT_ERROR = None
+except (ImportError, RuntimeError) as error:
+    decord = None
     DECORD_AVAILABLE = False
+    DECORD_IMPORT_ERROR = error
 
 try:
     import torchcodec
@@ -268,6 +271,14 @@ def get_frames_by_indices(
         vr = decord.VideoReader(video_path, **video_backend_kwargs)
         frames = vr.get_batch(indices)
         return frames.asnumpy()
+    elif video_backend == "decord_gpu":
+        if not DECORD_AVAILABLE:
+            raise ImportError("A CUDA-enabled Decord build is required for decord_gpu")
+        kwargs = dict(video_backend_kwargs)
+        gpu_id = kwargs.pop("gpu_id", 0)
+        kwargs.setdefault("ctx", decord.gpu(gpu_id))
+        vr = decord.VideoReader(video_path, **kwargs)
+        return vr.get_batch(indices).asnumpy()
     elif video_backend == "torchcodec":
         if not TORCHCODEC_AVAILABLE:
             raise ImportError("torchcodec is not available.")

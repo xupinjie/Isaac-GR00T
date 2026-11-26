@@ -16,29 +16,43 @@ providing episode-level data access with support for multi-modal data including:
 Returns messages with VLAStepData as defined in types.py.
 """
 
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 import json
 from pathlib import Path
 import random
 from typing import Any
 
-import numpy as np
-import pandas as pd
+# isort: off
+# PyNvVideoCodec must load before pandas/pyarrow to avoid native library conflicts.
+try:
+    import PyNvVideoCodec as pnvc
 
-from gr00t.data.types import ModalityConfig
-from gr00t.utils.initial_actions import INITIAL_ACTIONS_FILENAME, load_initial_actions
-from gr00t.utils.video_utils import get_frames_by_indices
+    PYNVVIDEOCODEC_AVAILABLE = True
+    PYNVVIDEOCODEC_IMPORT_ERROR = None
+except (ImportError, RuntimeError) as error:
+    pnvc = None
+    PYNVVIDEOCODEC_AVAILABLE = False
+    PYNVVIDEOCODEC_IMPORT_ERROR = error
 
-
-# Import NVIDIA on-demand video decoder with graceful fallback
 try:
     import accvlab.on_demand_video_decoder as nvc
 
     NVC_AVAILABLE = True
-except ImportError:
+    NVC_IMPORT_ERROR = None
+except (ImportError, RuntimeError) as error:
+    nvc = None
     NVC_AVAILABLE = False
+    NVC_IMPORT_ERROR = error
 
+import numpy as np
+import pandas as pd
 import torch
+# isort: on
+
+from gr00t.data.types import ModalityConfig
+from gr00t.utils.initial_actions import INITIAL_ACTIONS_FILENAME, load_initial_actions
+
+from .video_backends import normalize_video_backend, supported_video_backends
 
 
 # LeRobot standard metadata filenames
@@ -123,8 +137,14 @@ class LeRobotEpisodeLoader:
         3. Computing effective episode lengths based on action horizon
         """
         self.dataset_path = Path(dataset_path)
-        self.video_backend = video_backend
+        self.video_backend = normalize_video_backend(video_backend)
         self.video_backend_kwargs = video_backend_kwargs
+
+        if self.video_backend not in supported_video_backends():
+            raise ValueError(
+                f"Unsupported video backend: {video_backend!r}. "
+                f"Choose one of: {', '.join(supported_video_backends())}."
+            )
 
         if not self.dataset_path.is_dir():
             raise FileNotFoundError(f"Dataset path does not exist: {self.dataset_path}")
@@ -138,14 +158,27 @@ class LeRobotEpisodeLoader:
         # Compute effective episode lengths accounting for action horizon
         self.episode_lengths = self.get_episode_lengths()
 
-        # Initialize NVC decoder if using nvc backend (lazy initialization)
-        self._nvc_decoder = None
-        if self.video_backend == "nvc":
+        self._accvlab_decoder = None
+        if self.video_backend == "accvlab":
             if not NVC_AVAILABLE:
                 raise ImportError(
                     "accvlab.on_demand_video_decoder is not available. "
                     "Please install it or use a different video_backend."
-                )
+                ) from NVC_IMPORT_ERROR
+        self._pynv_decoder = None
+        self._pynv_path = None
+        if self.video_backend == "pynvvideocodec" and not PYNVVIDEOCODEC_AVAILABLE:
+            raise ImportError(
+                "PyNvVideoCodec is not available. Install it or use a different video_backend."
+            ) from PYNVVIDEOCODEC_IMPORT_ERROR
+        if self.video_backend == "decord_gpu":
+            from gr00t.utils.video_utils import DECORD_AVAILABLE, DECORD_IMPORT_ERROR
+
+            if not DECORD_AVAILABLE:
+                raise ImportError(
+                    "A CUDA-enabled Decord build is required for the decord_gpu backend."
+                ) from DECORD_IMPORT_ERROR
+        self._decord_readers = OrderedDict()
 
     def _load_metadata(self) -> None:
         """
@@ -374,11 +407,20 @@ class LeRobotEpisodeLoader:
         chunk_idx = episode_index // self.chunk_size
         image_keys = self.modality_configs["video"].modality_keys
 
-        # Use NVC backend for GPU-accelerated multi-camera decoding
-        if self.video_backend == "nvc":
-            return self._load_video_data_nvc(episode_index, indices, chunk_idx, image_keys)
+        if self.video_backend == "accvlab":
+            return self._load_video_data_accvlab(episode_index, indices, chunk_idx, image_keys)
+        if self.video_backend == "pynvvideocodec":
+            return self._load_video_data_pynvvideocodec(
+                episode_index, indices, chunk_idx, image_keys
+            )
+        if self.video_backend == "decord_gpu":
+            return self._load_video_data_decord_gpu(
+                episode_index, indices, chunk_idx, image_keys
+            )
 
         # Default path: decode each camera separately using standard backends
+        from gr00t.utils.video_utils import get_frames_by_indices
+
         for image_key in image_keys:
             # Resolve the original key used in video file naming
             original_key = self.modality_meta["video"][image_key].get(
@@ -404,7 +446,105 @@ class LeRobotEpisodeLoader:
 
         return video_data
 
-    def _load_video_data_nvc(
+    def _load_video_data_decord_gpu(
+        self,
+        episode_index: int,
+        indices: np.ndarray,
+        chunk_idx: int,
+        image_keys: list[str],
+    ) -> dict[str, np.ndarray]:
+        from gr00t.utils.video_utils import decord
+
+        kwargs = dict(self.video_backend_kwargs or {})
+        gpu_id = kwargs.pop("gpu_id", 0)
+        cache_size = max(0, int(kwargs.pop("reader_cache_size", 8)))
+        kwargs.setdefault("num_threads", 1)
+        frame_indices = [int(index) for index in indices]
+        video_data = {}
+
+        for image_key in image_keys:
+            original_key = self.modality_meta["video"][image_key].get(
+                "original_key", f"observation.images.{image_key}"
+            )
+            assert original_key in self.feature_config, (
+                f"Original key {original_key} not found in feature config"
+            )
+            video_filename = self.video_path_pattern.format(
+                episode_chunk=chunk_idx,
+                video_key=original_key,
+                episode_index=episode_index,
+            )
+            path = str(self.dataset_path / video_filename)
+
+            reader = self._decord_readers.pop(path, None)
+            if reader is None:
+                reader = decord.VideoReader(path, ctx=decord.gpu(gpu_id), **kwargs)
+            if cache_size:
+                self._decord_readers[path] = reader
+                while len(self._decord_readers) > cache_size:
+                    self._decord_readers.popitem(last=False)
+
+            num_frames = len(reader)
+            if frame_indices and (
+                frame_indices[0] < 0 or frame_indices[-1] >= num_frames
+            ):
+                raise IndexError(
+                    f"Frame indices [{frame_indices[0]}, {frame_indices[-1]}] are outside "
+                    f"video range [0, {num_frames}) for {path}"
+                )
+            video_data[image_key] = reader.get_batch(frame_indices).asnumpy()
+
+        return video_data
+
+    def _load_video_data_pynvvideocodec(
+        self,
+        episode_index: int,
+        indices: np.ndarray,
+        chunk_idx: int,
+        image_keys: list[str],
+    ) -> dict[str, np.ndarray]:
+        video_paths = []
+        for image_key in image_keys:
+            original_key = self.modality_meta["video"][image_key].get(
+                "original_key", f"observation.images.{image_key}"
+            )
+            assert original_key in self.feature_config, (
+                f"Original key {original_key} not found in feature config"
+            )
+            video_filename = self.video_path_pattern.format(
+                episode_chunk=chunk_idx,
+                video_key=original_key,
+                episode_index=episode_index,
+            )
+            video_paths.append(str(self.dataset_path / video_filename))
+
+        gpu_id = (self.video_backend_kwargs or {}).get("gpu_id", 0)
+        frame_indices = [int(index) for index in indices]
+        video_data = {}
+        for image_key, path in zip(image_keys, video_paths):
+            if self._pynv_decoder is None:
+                self._pynv_decoder = pnvc.SimpleDecoder(
+                    path,
+                    gpu_id=gpu_id,
+                    use_device_memory=False,
+                    output_color_type=pnvc.OutputColorType.RGB,
+                    decoder_cache_size=1,
+                )
+            elif path != self._pynv_path:
+                self._pynv_decoder.reconfigure_decoder(path)
+            self._pynv_path = path
+
+            num_frames = len(self._pynv_decoder)
+            if frame_indices and (frame_indices[0] < 0 or frame_indices[-1] >= num_frames):
+                raise IndexError(
+                    f"Frame indices [{frame_indices[0]}, {frame_indices[-1]}] are outside "
+                    f"video range [0, {num_frames}) for {path}"
+                )
+            frames = self._pynv_decoder.get_batch_frames_by_index(frame_indices)
+            video_data[image_key] = np.stack([np.from_dlpack(frame) for frame in frames])
+        return video_data
+
+    def _load_video_data_accvlab(
         self,
         episode_index: int,
         indices: np.ndarray,
@@ -412,7 +552,7 @@ class LeRobotEpisodeLoader:
         image_keys: list[str],
     ) -> dict[str, np.ndarray]:
         """
-        Load video data using NVIDIA GPU-accelerated decoder (nvc backend).
+        Load video data using the ACCV-Lab GPU decoder.
 
         This method decodes frames from multiple camera videos simultaneously,
         leveraging GPU hardware decoding for optimal performance with sequential
@@ -427,13 +567,13 @@ class LeRobotEpisodeLoader:
         Returns:
             Dictionary mapping camera view names to arrays of decoded frames
         """
-        torch.cuda.nvtx.range_push(f"nvc_load_video_ep{episode_index}")
+        torch.cuda.nvtx.range_push(f"accvlab_load_video_ep{episode_index}")
 
         num_cameras = len(image_keys)
         num_frames = len(indices)
 
         # Build video paths for all cameras
-        torch.cuda.nvtx.range_push("nvc_build_video_paths")
+        torch.cuda.nvtx.range_push("accvlab_build_video_paths")
         video_paths = []
         for image_key in image_keys:
             original_key = self.modality_meta["video"][image_key].get(
@@ -447,30 +587,31 @@ class LeRobotEpisodeLoader:
                 episode_chunk=chunk_idx, video_key=original_key, episode_index=episode_index
             )
             video_paths.append(str(self.dataset_path / video_filename))
-        torch.cuda.nvtx.range_pop()  # nvc_build_video_paths
+        torch.cuda.nvtx.range_pop()
 
-        # Lazy initialize NVC decoder
-        if self._nvc_decoder is None:
-            torch.cuda.nvtx.range_push("nvc_init_decoder")
+        if self._accvlab_decoder is None:
+            torch.cuda.nvtx.range_push("accvlab_init_decoder")
             gpu_id = (self.video_backend_kwargs or {}).get("gpu_id", 0)
-            self._nvc_decoder = nvc.CreateSampleReader(
+            self._accvlab_decoder = nvc.CreateSampleReader(
                 num_of_set=1,  # Sequential access to same video set
                 num_of_file=num_cameras,  # Number of cameras
                 iGpu=gpu_id,
             )
-            torch.cuda.nvtx.range_pop()  # nvc_init_decoder
+            torch.cuda.nvtx.range_pop()
 
         # Decode all frames: iterate over frame indices, decode all cameras per frame
         # Temporary storage: list of frames for each camera
         frame_lists = {key: [] for key in image_keys}
         as_bgr = (self.video_backend_kwargs or {}).get("as_bgr", False)
 
-        torch.cuda.nvtx.range_push(f"nvc_decode_frames_n{num_frames}")
+        torch.cuda.nvtx.range_push(f"accvlab_decode_frames_n{num_frames}")
         for frame_idx in indices:
             # Decode one frame from each camera simultaneously
-            torch.cuda.nvtx.range_push(f"nvc_decode_frame_{frame_idx}")
+            torch.cuda.nvtx.range_push(f"accvlab_decode_frame_{frame_idx}")
             frame_indices = [int(frame_idx)] * num_cameras
-            decoded_frames = self._nvc_decoder.DecodeN12ToRGB(video_paths, frame_indices, as_bgr)
+            decoded_frames = self._accvlab_decoder.DecodeN12ToRGB(
+                video_paths, frame_indices, as_bgr
+            )
 
             # Convert CUDA frames to numpy and append to each camera's list
             for i, image_key in enumerate(image_keys):
@@ -478,15 +619,15 @@ class LeRobotEpisodeLoader:
                 frame_np = np.expand_dims(frame_np, axis=0)  # (H, W, C) -> (1, H, W, C)
                 frame_lists[image_key].append(frame_np)
 
-            torch.cuda.nvtx.range_pop()  # nvc_decode_frame_{frame_idx}
-        torch.cuda.nvtx.range_pop()  # nvc_decode_frames_n{num_frames}
+            torch.cuda.nvtx.range_pop()
+        torch.cuda.nvtx.range_pop()
 
         # Concatenate frames into final video_data: dict[str, ndarray] with shape (N, H, W, C)
-        torch.cuda.nvtx.range_push("nvc_concat_frames")
+        torch.cuda.nvtx.range_push("accvlab_concat_frames")
         video_data = {key: np.concatenate(frames, axis=0) for key, frames in frame_lists.items()}
-        torch.cuda.nvtx.range_pop()  # nvc_concat_frames
+        torch.cuda.nvtx.range_pop()
 
-        torch.cuda.nvtx.range_pop()  # nvc_load_video_ep{episode_index}
+        torch.cuda.nvtx.range_pop()
 
         return video_data
 
@@ -648,7 +789,7 @@ class LeRobotEpisodeLoader:
         step_indices: np.ndarray,
     ) -> pd.DataFrame:
         """
-        Load episode data with on-demand video decoding (nvc backend optimization).
+        Load sparse episode data with an on-demand video decoder.
 
         This method only decodes the video frames that are actually needed based on
         step_indices and modality delta_indices, saving ~90% decoding overhead when
@@ -669,8 +810,8 @@ class LeRobotEpisodeLoader:
             other positions are None.
 
         Note:
-            This method is specifically designed for nvc backend. Other backends
-            should continue using __getitem__ which decodes all frames.
+            The sharded dataset uses this path for on-demand decoders. Full-episode
+            backends continue using ``__getitem__``.
         """
         if episode_index < 0 or episode_index >= len(self):
             raise IndexError(f"Episode index {episode_index} out of bounds")

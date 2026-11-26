@@ -120,12 +120,14 @@ class FinetuneConfig:
     video_backend: str = "torchcodec"
     """
     Video decoding backend to use for loading video frames.
-    Options: "torchcodec", "decord", "ffmpeg", "opencv", "nvc" (NVIDIA GPU decoder).
+    GPU options: "accvlab", "pynvvideocodec", and "decord_gpu". CPU options:
+    "torchcodec", "decord", "ffmpeg", and "opencv". "nvc" remains an alias
+    for "accvlab".
     """
 
-    multiprocessing_context: str = "fork"
+    multiprocessing_context: str = "auto"
     """
     Multiprocessing context for dataloader workers.
-    Options: "fork", "spawn", "forkserver".
-    Use "spawn" when video_backend="nvc" (NVIDIA GPU decoder requires spawn mode).
+    Options: "auto", "fork", "spawn", "forkserver". "auto" selects "spawn"
+    for on-demand GPU decoders and "fork" for CPU decoders.
     """

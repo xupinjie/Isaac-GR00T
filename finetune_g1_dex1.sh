@@ -20,10 +20,10 @@ rm -rf output_g1_dex1/checkpoint-*
 
 # Paths
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BASE_MODEL_PATH="nvidia/GR00T-N1.6-3B"
-DATASET_PATH="/home/scratch.pinjiex_hw/datas/G1_Dex1_3Picktask_Dataset_Merge_dedup"
+BASE_MODEL_PATH=${BASE_MODEL_PATH:-nvidia/GR00T-N1.6-3B}
+DATASET_PATH=${DATASET_PATH:-/home/scratch.pinjiex_hw/datas/G1_Dex1_3Picktask_Dataset_Merge_dedup}
 MODALITY_CONFIG_PATH="${SCRIPT_DIR}/unitree_g1_dex1_config.py"
-OUTPUT_DIR="${SCRIPT_DIR}/output_g1_dex1"
+OUTPUT_DIR=${OUTPUT_DIR:-${SCRIPT_DIR}/output_g1_dex1}
 
 # Training parameters
 NUM_GPUS=${NUM_GPUS:-8}
@@ -34,19 +34,50 @@ MAX_STEPS=${MAX_STEPS:-1200}
 SAVE_STEPS=${SAVE_STEPS:-30000}
 SAVE_TOTAL_LIMIT=${SAVE_TOTAL_LIMIT:-10}
 WARMUP_RATIO=${WARMUP_RATIO:-0.05}
-DATALOADER_NUM_WORKERS=${DATALOADER_NUM_WORKERS:-4}
 MASTER_PORT=${MASTER_PORT:-29501}
 
-# Video decoding backend: "torchcodec", "decord", "ffmpeg", "opencv", "nvc" (NVIDIA GPU decoder)
+# Decoder switch. GPU options: "accvlab", "pynvvideocodec", "decord_gpu".
+# CPU reference options: "torchcodec", "decord", "ffmpeg", "opencv".
+# The legacy name "nvc" is accepted as an alias for "accvlab".
 VIDEO_BACKEND=${VIDEO_BACKEND:-torchcodec}
+case "${VIDEO_BACKEND,,}" in
+    accvlab|accv-lab|nvc)
+        VIDEO_BACKEND=accvlab
+        ;;
+    pynvvideocodec|pynv)
+        VIDEO_BACKEND=pynvvideocodec
+        ;;
+    decord_gpu|decord-gpu|decord_cuda)
+        VIDEO_BACKEND=decord_gpu
+        ;;
+    torchcodec|decord|ffmpeg|opencv)
+        VIDEO_BACKEND=${VIDEO_BACKEND,,}
+        ;;
+    *)
+        echo "Error: Unsupported VIDEO_BACKEND=${VIDEO_BACKEND}"
+        echo "Supported backends: accvlab, pynvvideocodec, decord_gpu, torchcodec, decord, ffmpeg, opencv"
+        exit 2
+        ;;
+esac
+
+if [ -z "${DATALOADER_NUM_WORKERS:-}" ]; then
+    if [ "${VIDEO_BACKEND}" = "decord_gpu" ]; then
+        DATALOADER_NUM_WORKERS=1
+    else
+        DATALOADER_NUM_WORKERS=4
+    fi
+fi
 
 # Multiprocessing context: "fork", "spawn", "forkserver"
-# Use "spawn" when VIDEO_BACKEND="nvc" (NVIDIA GPU decoder requires spawn mode)
-if [ "${VIDEO_BACKEND}" = "nvc" ]; then
-    MULTIPROCESSING_CONTEXT=${MULTIPROCESSING_CONTEXT:-spawn}
-else
-    MULTIPROCESSING_CONTEXT=${MULTIPROCESSING_CONTEXT:-fork}
-fi
+# GPU video decoders require spawn mode.
+case "${VIDEO_BACKEND}" in
+    accvlab|pynvvideocodec|decord_gpu)
+        MULTIPROCESSING_CONTEXT=${MULTIPROCESSING_CONTEXT:-spawn}
+        ;;
+    torchcodec|decord|ffmpeg|opencv)
+        MULTIPROCESSING_CONTEXT=${MULTIPROCESSING_CONTEXT:-fork}
+        ;;
+esac
 
 # ============================================================================
 # Validate prerequisites

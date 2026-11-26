@@ -8,6 +8,7 @@ from gr00t.data.interfaces import ShardedDataset
 from gr00t.data.types import EmbodimentTag, MessageType, ModalityConfig, VLAStepData
 
 from .lerobot_episode_loader import LeRobotEpisodeLoader
+from .video_backends import is_on_demand_video_backend, normalize_video_backend
 
 
 def extract_step_data(
@@ -31,7 +32,7 @@ def extract_step_data(
             indices_to_load = [max(0, min(idx, max_valid_index)) for idx in indices_to_load]
         for key in config.modality_keys:
             if f"{modality}.{key}" in episode_data.columns:
-                # Use .loc for label-based indexing (supports sparse DataFrame from nvc backend)
+                # Use .loc for label-based indexing (supports sparse episode data).
                 modality_data = episode_data[f"{modality}.{key}"].loc[indices_to_load]
             else:
                 raise KeyError(
@@ -132,7 +133,7 @@ class ShardedSingleStepDataset(ShardedDataset):
         super().__init__(dataset_path)
         self.embodiment_tag = embodiment_tag
         self.modality_configs = modality_configs
-        self.video_backend = video_backend
+        self.video_backend = normalize_video_backend(video_backend)
         self.video_backend_kwargs = video_backend_kwargs
         self.shard_size = shard_size
         self.episode_sampling_rate = episode_sampling_rate
@@ -146,7 +147,7 @@ class ShardedSingleStepDataset(ShardedDataset):
         self.episode_loader = LeRobotEpisodeLoader(
             dataset_path=dataset_path,
             modality_configs=modality_configs,
-            video_backend=video_backend,
+            video_backend=self.video_backend,
             video_backend_kwargs=video_backend_kwargs,
         )
 
@@ -187,11 +188,14 @@ class ShardedSingleStepDataset(ShardedDataset):
 
         # Distribute episode sub-sequences across shards
         for ep_idx in shuffled_episode_indices:
-            # Split episode timesteps into multiple sub-sequences
             step_indices = np.arange(0, self.get_effective_episode_length(ep_idx))
-            self.rng.shuffle(step_indices)
-            for i in range(num_splits):
-                split_step_indices = step_indices[i::num_splits]
+            if self.video_backend != "pynvvideocodec" and is_on_demand_video_backend(self.video_backend):
+                episode_splits = np.array_split(step_indices, num_splits)
+            else:
+                self.rng.shuffle(step_indices)
+                episode_splits = [step_indices[i::num_splits] for i in range(num_splits)]
+
+            for split_step_indices in episode_splits:
                 # Assign to shard with minimum current length (greedy balancing)
                 shard_index = np.argmin(shard_lengths)
                 sharded_episodes[shard_index].append((ep_idx, split_step_indices))
@@ -254,8 +258,7 @@ class ShardedSingleStepDataset(ShardedDataset):
         Loads the required episodes and extracts all timesteps assigned to this shard,
         applying the configured processor to each timestep.
 
-        For nvc backend, uses on-demand decoding to only decode required frames,
-        saving decoding overhead when episode_sampling_rate is low.
+        GPU video backends use on-demand decoding to load only the required frames.
 
         Args:
             idx: Shard index to load
@@ -266,9 +269,7 @@ class ShardedSingleStepDataset(ShardedDataset):
         episodes = self.sharded_episodes[idx]
         datapoints = []
         for ep_idx, step_indices in episodes:
-            # For nvc backend: use on-demand decoding to save ~90% decoding overhead
-            # For other backends: use original full episode loading
-            if self.video_backend == "nvc":
+            if is_on_demand_video_backend(self.video_backend):
                 episode_data = self.episode_loader.load_episode_sampled(ep_idx, step_indices)
             else:
                 episode_data = self.episode_loader[ep_idx]

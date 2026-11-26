@@ -8,6 +8,10 @@ import tyro
 
 from gr00t.configs.base_config import get_default_config
 from gr00t.configs.finetune_config import FinetuneConfig
+from gr00t.data.dataset.video_backends import (
+    multiprocessing_context_for,
+    normalize_video_backend,
+)
 from gr00t.experiment.experiment import run
 
 
@@ -88,7 +92,11 @@ if __name__ == "__main__":
     config.data.shard_size = ft_config.shard_size
     config.data.episode_sampling_rate = ft_config.episode_sampling_rate
     config.data.num_shards_per_epoch = ft_config.num_shards_per_epoch
-    config.data.video_backend = ft_config.video_backend
-    config.data.multiprocessing_context = ft_config.multiprocessing_context
+    config.data.video_backend = normalize_video_backend(ft_config.video_backend)
+    config.data.multiprocessing_context = (
+        multiprocessing_context_for(config.data.video_backend)
+        if ft_config.multiprocessing_context == "auto"
+        else ft_config.multiprocessing_context
+    )
 
     run(config)
