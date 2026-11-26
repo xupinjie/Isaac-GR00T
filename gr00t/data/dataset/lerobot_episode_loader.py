@@ -614,6 +614,10 @@ class LeRobotEpisodeLoader:
         for video_path, frame_ids in zip(request.video_paths, request.frame_ids):
             refs_by_key = {}
             for frame_id in frame_ids:
+                # Queue one hand-off per distinct GOP in this camera request.
+                if any(r.first_frame_id <= frame_id < r.first_frame_id + r.gop_len
+                       for r in refs_by_key.values()):
+                    continue
                 ref = self._nvc_gop_store.lookup(video_path, int(frame_id))
                 if ref is None:
                     # SharedGopStore is only a hand-off queue; the per-file cache

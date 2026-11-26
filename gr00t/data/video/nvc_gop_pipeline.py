@@ -252,7 +252,8 @@ class NvcGopBatchPrefetcher:
         path_to_group: dict[str, int] = {}
         video_paths: list[str] = []
         frame_ids: list[list[int]] = []
-        refs_by_group: list[dict[tuple[int, int, str], Any]] = []
+        received_refs: list[Any] = []
+        indices_by_group: list[dict[tuple[int, int, str], int]] = []
         sample_occurrences: list[list[_VideoOccurrence]] = []
         for request in requests:
             assert request.gop_refs is not None
@@ -278,7 +279,7 @@ class NvcGopBatchPrefetcher:
                     path_to_group[path] = group_index
                     video_paths.append(path)
                     frame_ids.append([])
-                    refs_by_group.append({})
+                    indices_by_group.append({})
                 positions = tuple(
                     range(
                         len(frame_ids[group_index]),
@@ -287,9 +288,9 @@ class NvcGopBatchPrefetcher:
                 )
                 frame_ids[group_index].extend(int(frame_id) for frame_id in ids)
                 for ref in refs:
-                    refs_by_group[group_index][
-                        (int(ref.first_frame_id), int(ref.gop_len), ref.shm_name)
-                    ] = ref
+                    key = (int(ref.first_frame_id), int(ref.gop_len), ref.shm_name)
+                    indices_by_group[group_index][key] = len(received_refs)
+                    received_refs.append(ref)
                 occurrences.append(
                     _VideoOccurrence(
                         group_index=group_index,
@@ -312,19 +313,12 @@ class NvcGopBatchPrefetcher:
             ids + [ids[-1]] * (max_frames - len(ids)) for ids in frame_ids
         ]
 
-        flat_refs: list[Any] = []
-        ref_counts: list[int] = []
-        for refs in refs_by_group:
-            ordered_refs = [refs[key] for key in sorted(refs)]
-            flat_refs.extend(ordered_refs)
-            ref_counts.append(len(ordered_refs))
-
-        arrays = self._store.get_batch(flat_refs)
-        numpy_datas: list[list[Any]] = []
-        offset = 0
-        for count in ref_counts:
-            numpy_datas.append(arrays[offset : offset + count])
-            offset += count
+        # Equal GOPs from separate worker lookups can own separate pins. Open
+        # every received reference; only the decoder input is deduplicated.
+        arrays = self._store.get_batch(received_refs)
+        numpy_datas = [
+            [arrays[group[key]] for key in sorted(group)] for group in indices_by_group
+        ]
 
         self._decoder.DecodeFromGOPListRGB(
             numpy_datas,
